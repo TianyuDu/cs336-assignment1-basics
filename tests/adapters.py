@@ -84,7 +84,7 @@ def run_swiglu(
     from cs336_basics.positionwise_feedforward import SwiGLU
     import torch
 
-    swiglu = SwiGLU(d_model)
+    swiglu = SwiGLU(d_model, d_ff=d_ff)
     # Assign weights manually, since the parameter names differ (`W1`, `W2`, `W3`)
     swiglu.W1.data = w1_weight
     swiglu.W2.data = w2_weight
@@ -146,7 +146,18 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from cs336_basics.multihead_self_attentinon import CausalMultiHeadSelfAttention
+
+    attn = CausalMultiHeadSelfAttention(d_model=d_model, num_heads=num_heads)
+    attn.load_state_dict(
+        {
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "output_proj.weight": o_proj_weight,
+        }
+    )
+    return attn(in_features, use_rope=False)
 
 
 def run_multihead_self_attention_with_rope(
@@ -186,7 +197,23 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from cs336_basics.multihead_self_attentinon import CausalMultiHeadSelfAttention
+
+    attn = CausalMultiHeadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+    )
+    attn.load_state_dict(
+        {
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "output_proj.weight": o_proj_weight,
+        }
+    )
+    return attn(in_features, token_positions=token_positions, use_rope=True)
 
 
 def run_rope(
@@ -289,7 +316,29 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer_block import TransformerBlock
+
+    block = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        theta=theta,
+    )
+    block.load_state_dict(
+        {
+            "attn.q_proj.weight": weights["attn.q_proj.weight"],
+            "attn.k_proj.weight": weights["attn.k_proj.weight"],
+            "attn.v_proj.weight": weights["attn.v_proj.weight"],
+            "attn.output_proj.weight": weights["attn.output_proj.weight"],
+            "ln1.weight": weights["ln1.weight"],
+            "ffn.W1": weights["ffn.w1.weight"],
+            "ffn.W2": weights["ffn.w2.weight"],
+            "ffn.W3": weights["ffn.w3.weight"],
+            "ln2.weight": weights["ln2.weight"],
+        }
+    )
+    return block(in_features, use_rope=True)
 
 
 def run_transformer_lm(
