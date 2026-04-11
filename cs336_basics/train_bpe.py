@@ -81,7 +81,7 @@ def train_bpe(
         raw_bytes = f.read()
 
     # parallel pre-tokenization
-    num_chunks = os.cpu_count() or 1
+    num_chunks = os.cpu_count() // 2 or 1  # need to watch Youtube during the training, don't take all my CPU cores.
     chunk_boundaries = _find_chunk_boundaries(raw_bytes, num_chunks, special_tokens_bytes)
     chunk_ranges = [
         (start, end)
