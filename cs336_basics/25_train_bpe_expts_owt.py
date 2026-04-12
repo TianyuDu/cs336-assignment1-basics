@@ -1,5 +1,5 @@
 """
-Run the TinyStories BPE experiment and dump a small report.
+Run the OpenWebText BPE experiment and dump a small report.
 """
 
 import json
@@ -11,13 +11,14 @@ from pathlib import Path
 from cs336_basics.train_bpe import train_bpe
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_PATH = ROOT / "data" / "TinyStoriesV2-GPT4-train.txt"
-OUTPUT_DIR = ROOT / "data" / "bpe_tinystories"
+DATA_PATH = ROOT / "data" / "owt_train.txt"
+OUTPUT_DIR = ROOT / "data" / "bpe_owt"
 
-VOCAB_SIZE = 10_000
+VOCAB_SIZE = 32_000
 SPECIAL_TOKEN = "<|endoftext|>"
 SPECIAL_TOKEN_BYTES = SPECIAL_TOKEN.encode("utf-8")
 RSS_SAMPLE_INTERVAL_S = 0.5
+NUM_LONGEST_TOKENS_TO_SHOW = 10
 
 STAGES = [
     ("read_input_s", "Read input"),
@@ -110,6 +111,12 @@ def stage_rows(stats: dict[str, int | float]) -> list[tuple[str, float, float]]:
     return rows
 
 
+def longest_tokens(vocab: dict[int, bytes], limit: int = NUM_LONGEST_TOKENS_TO_SHOW) -> list[bytes]:
+    non_special_tokens = [token for token in vocab.values() if token != SPECIAL_TOKEN_BYTES]
+    non_special_tokens.sort(key=lambda token: (len(token), token), reverse=True)
+    return non_special_tokens[:limit]
+
+
 def save_vocab_and_merges(vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]]) -> None:
     vocab_json = {str(token_id): list(token_bytes) for token_id, token_bytes in vocab.items()}
     with open(OUTPUT_DIR / "vocab.json", "w") as f:
@@ -123,11 +130,10 @@ def save_vocab_and_merges(vocab: dict[int, bytes], merges: list[tuple[bytes, byt
 def write_report(
     stats: dict[str, int | float],
     peak_rss_kib: int,
-    longest_token: bytes,
+    longest_token_list: list[bytes],
     special_token_present: bool,
     rows: list[tuple[str, float, float]],
 ) -> None:
-    longest_text = token_text(longest_token)
     bottleneck_label, bottleneck_s, bottleneck_share = max(rows, key=lambda row: row[1])
 
     report = {
@@ -139,11 +145,14 @@ def write_report(
         "special_token_present": special_token_present,
         "peak_process_tree_rss_kib": peak_rss_kib,
         "peak_process_tree_rss_gib": gib_from_kib(peak_rss_kib),
-        "longest_token": {
-            "bytes_repr": repr(longest_token),
-            "decoded": longest_text,
-            "length_bytes": len(longest_token),
-        },
+        "longest_tokens": [
+            {
+                "bytes_repr": repr(token),
+                "decoded": token_text(token),
+                "length_bytes": len(token),
+            }
+            for token in longest_token_list
+        ],
         "stage_timings": [
             {"stage": label, "seconds": seconds, "share_pct": share}
             for label, seconds, share in rows
@@ -158,17 +167,22 @@ def write_report(
     (OUTPUT_DIR / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 
     lines = [
-        "# TinyStories BPE experiment",
+        "# OpenWebText BPE experiment",
         "",
         f"- Data: `{DATA_PATH}`",
         f"- Output directory: `{OUTPUT_DIR}`",
         f"- Target vocab size: `{VOCAB_SIZE}`",
         f"- Special token present: `{special_token_present}`",
         f"- Peak process-tree RSS (sampled): `{gib_from_kib(peak_rss_kib):.2f} GiB`",
-        f"- Longest token: `{repr(longest_token)}` decoded as `{longest_text}`",
         "",
-        "## Stage timings",
+        "## Longest tokens",
     ]
+    lines.extend(
+        f"- `{repr(token)}` decoded as `{token_text(token)}` ({len(token)} bytes)"
+        for token in longest_token_list
+    )
+    lines.append("")
+    lines.append("## Stage timings")
     lines.extend(
         f"- {label}: {seconds:.1f}s ({share:.1f}% of total)" for label, seconds, share in rows
     )
@@ -181,18 +195,17 @@ def write_report(
 def print_summary(
     stats: dict[str, int | float],
     peak_rss_kib: int,
-    longest_token: bytes,
+    longest_token_list: list[bytes],
     special_token_present: bool,
     rows: list[tuple[str, float, float]],
 ) -> None:
     total_s = float(stats["total_s"])
     input_bytes = int(stats["input_bytes"])
     input_gib = input_bytes / (1024**3)
-    longest_text = token_text(longest_token)
     bottleneck_label, bottleneck_s, bottleneck_share = max(rows, key=lambda row: row[1])
 
     print("\n" + "=" * 72)
-    print("TinyStories BPE Experiment")
+    print("OpenWebText BPE Experiment")
     print("=" * 72)
     print(f"Data path: {DATA_PATH}")
     print(f"Output directory: {OUTPUT_DIR}")
@@ -222,10 +235,9 @@ def print_summary(
     print(f"- Unique token sequences: {int(stats['unique_token_sequences'])}")
     print(f"- Initial distinct adjacent pairs: {int(stats['initial_pair_count'])}")
 
-    print("\nLongest token")
-    print(f"- Bytes repr: {longest_token!r}")
-    print(f"- Decoded text: {longest_text!r}")
-    print(f"- Length: {len(longest_token)} bytes")
+    print("\nLongest tokens")
+    for i, token in enumerate(longest_token_list, start=1):
+        print(f"- {i}. {token!r} decoded as {token_text(token)!r} ({len(token)} bytes)")
 
     print("\nStage timings")
     for label, seconds, share in rows:
@@ -251,16 +263,13 @@ def main() -> None:
     finally:
         peak_rss_kib = monitor.stop()
 
-    longest_token = max(
-        (token for token in vocab.values() if token != SPECIAL_TOKEN_BYTES),
-        key=len,
-    )
     special_token_present = SPECIAL_TOKEN_BYTES in vocab.values()
     rows = stage_rows(stats)
+    longest_token_list = longest_tokens(vocab)
 
     save_vocab_and_merges(vocab, merges)
-    write_report(stats, peak_rss_kib, longest_token, special_token_present, rows)
-    print_summary(stats, peak_rss_kib, longest_token, special_token_present, rows)
+    write_report(stats, peak_rss_kib, longest_token_list, special_token_present, rows)
+    print_summary(stats, peak_rss_kib, longest_token_list, special_token_present, rows)
 
 
 if __name__ == "__main__":
