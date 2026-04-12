@@ -120,57 +120,114 @@ def train_bpe(
         vocab[next_id] = bytes([i])
         next_id += 1
 
-    # BPE merge loop with incremental pair count updates
+    # BPE merge loop
     merges: list[tuple[bytes, bytes]] = []
     num_merges = vocab_size - len(vocab)
 
-    pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+    # index: for each token, which sequences contain it?
+    # This lets us skip sequences that can't contain the best pair.
+    from collections import defaultdict
+    token_to_seqs: dict[bytes, set[tuple[bytes, ...]]] = defaultdict(set)
+    for seq in token_counts:
+        for tok in seq:
+            token_to_seqs[tok].add(seq)
+
+    import heapq
+
+    pair_counts: dict[tuple[bytes, bytes], int] = {}
     for seq, count in token_counts.items():
         for left, right in zip(seq, seq[1:]):
-            pair_counts[(left, right)] += count
+            pair = (left, right)
+            pair_counts[pair] = pair_counts.get(pair, 0) + count
+
+    # max-heap by count only; ties are resolved by collecting all pairs at max count
+    heap = [(-c, pair) for pair, c in pair_counts.items()]
+    heapq.heapify(heap)
+
+    def _push(pair):
+        c = pair_counts.get(pair, 0)
+        if c > 0:
+            heapq.heappush(heap, (-c, pair))
 
     for _ in range(num_merges):
-        if not pair_counts:
+        # find best valid pair (skip stale entries)
+        while heap:
+            neg_c, best_pair = heapq.heappop(heap)
+            if pair_counts.get(best_pair, 0) == -neg_c:
+                break
+        else:
             break
 
-        best_pair = max(pair_counts, key=lambda p: (pair_counts[p], p))
+        # collect any ties at the same count and pick lexicographically greatest
+        top_count = -neg_c
+        tied = [best_pair]
+        while heap and heap[0][0] == neg_c:
+            _, candidate = heapq.heappop(heap)
+            if pair_counts.get(candidate, 0) == top_count:
+                tied.append(candidate)
+            # else stale, just discard
+        best_pair = max(tied)
+        # push back the non-winners
+        for p in tied:
+            if p != best_pair:
+                heapq.heappush(heap, (neg_c, p))
+
         merged_token = best_pair[0] + best_pair[1]
         merges.append(best_pair)
         vocab[next_id] = merged_token
         next_id += 1
 
-        new_token_counts: Counter[tuple[bytes, ...]] = Counter()
-        for seq, count in token_counts.items():
+        # only iterate over sequences that contain BOTH tokens in the pair
+        candidates = token_to_seqs.get(best_pair[0], set()) & token_to_seqs.get(best_pair[1], set())
+
+        for seq in list(candidates):
+            # check if the pair actually appears adjacent
             has_pair = False
             for i in range(len(seq) - 1):
                 if seq[i] == best_pair[0] and seq[i + 1] == best_pair[1]:
                     has_pair = True
                     break
             if not has_pair:
-                new_token_counts[seq] += count
                 continue
 
+            count = token_counts[seq]
+
+            # build merged sequence
             new_seq: list[bytes] = []
             i = 0
             while i < len(seq):
                 if i < len(seq) - 1 and seq[i] == best_pair[0] and seq[i + 1] == best_pair[1]:
-                    if new_seq:
-                        pair_counts[(new_seq[-1], best_pair[0])] -= count
-                    if i + 2 < len(seq):
-                        pair_counts[(best_pair[1], seq[i + 2])] -= count
-                    if new_seq:
-                        pair_counts[(new_seq[-1], merged_token)] += count
                     new_seq.append(merged_token)
                     i += 2
-                    if i < len(seq):
-                        pair_counts[(merged_token, seq[i])] += count
                 else:
                     new_seq.append(seq[i])
                     i += 1
-            new_token_counts[tuple(new_seq)] += count
+            new_seq_tuple = tuple(new_seq)
 
-        del pair_counts[best_pair]
-        pair_counts = Counter({k: v for k, v in pair_counts.items() if v > 0})
-        token_counts = new_token_counts
+            # update pair_counts: remove old pairs, add new ones
+            changed_pairs: set[tuple[bytes, bytes]] = set()
+            for left, right in zip(seq, seq[1:]):
+                p = (left, right)
+                pair_counts[p] -= count
+                if pair_counts[p] == 0:
+                    del pair_counts[p]
+                else:
+                    changed_pairs.add(p)
+            for left, right in zip(new_seq, new_seq[1:]):
+                p = (left, right)
+                pair_counts[p] = pair_counts.get(p, 0) + count
+                changed_pairs.add(p)
+            for p in changed_pairs:
+                _push(p)
+
+            # update token_counts
+            del token_counts[seq]
+            token_counts[new_seq_tuple] = token_counts.get(new_seq_tuple, 0) + count
+
+            # update token_to_seqs index
+            for tok in seq:
+                token_to_seqs[tok].discard(seq)
+            for tok in new_seq_tuple:
+                token_to_seqs[tok].add(new_seq_tuple)
 
     return vocab, merges

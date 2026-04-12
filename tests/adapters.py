@@ -420,7 +420,39 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer_lm import TransformerLM
+
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+    )
+
+    remapped_weights: dict[str, Tensor] = {
+        "token_embeddings.weight": weights["token_embeddings.weight"],
+        "ln_final.weight": weights["ln_final.weight"],
+        "lm_head.weight": weights["lm_head.weight"],
+    }
+
+    for layer_idx in range(num_layers):
+        src = f"layers.{layer_idx}"
+        dst = f"transformer_blocks.{layer_idx}"
+        remapped_weights[f"{dst}.attn.q_proj.weight"] = weights[f"{src}.attn.q_proj.weight"]
+        remapped_weights[f"{dst}.attn.k_proj.weight"] = weights[f"{src}.attn.k_proj.weight"]
+        remapped_weights[f"{dst}.attn.v_proj.weight"] = weights[f"{src}.attn.v_proj.weight"]
+        remapped_weights[f"{dst}.attn.output_proj.weight"] = weights[f"{src}.attn.output_proj.weight"]
+        remapped_weights[f"{dst}.ln1.weight"] = weights[f"{src}.ln1.weight"]
+        remapped_weights[f"{dst}.ffn.W1"] = weights[f"{src}.ffn.w1.weight"]
+        remapped_weights[f"{dst}.ffn.W2"] = weights[f"{src}.ffn.w2.weight"]
+        remapped_weights[f"{dst}.ffn.W3"] = weights[f"{src}.ffn.w3.weight"]
+        remapped_weights[f"{dst}.ln2.weight"] = weights[f"{src}.ln2.weight"]
+
+    model.load_state_dict(remapped_weights)
+    return model(in_indices)
 
 
 def run_rmsnorm(
@@ -518,7 +550,9 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    from cs336_basics.cross_entropy import cross_entropy
+
+    return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:

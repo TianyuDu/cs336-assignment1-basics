@@ -7,11 +7,16 @@ from jaxtyping import Float
 class SwiGLU(nn.Module):
     def __init__(
         self,
-        d_model: int
+        d_model: int,
+        d_ff: Optional[int] = None,
     ):
         super().__init__()
-        # Calculate d_ff, round to nearest multiple of 64
-        d_ff = int(round((8 / 3) * d_model / 64) * 64)
+        # If d_ff is not provided, use the assignment default hidden size.
+        if d_ff is None:
+            d_ff = int(round((8 / 3) * d_model / 64) * 64)
+
+        self.d_model = d_model
+        self.d_ff = d_ff
         self.W1 = nn.Parameter(torch.empty(d_ff, d_model))
         self.W2 = nn.Parameter(torch.empty(d_model, d_ff))
         self.W3 = nn.Parameter(torch.empty(d_ff, d_model))
