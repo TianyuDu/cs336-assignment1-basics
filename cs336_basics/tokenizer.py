@@ -5,6 +5,13 @@ import json
 import re
 from collections.abc import Iterable, Iterator
 
+import regex
+
+
+GPT2_PRETOKENIZER_PATTERN = regex.compile(
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+)
+
 
 class Tokenizer:
     def __init__(
@@ -13,9 +20,23 @@ class Tokenizer:
         merges: list[tuple[bytes, bytes]],
         special_tokens: list[str] | None = None,
     ) -> None:
-        self.vocab = vocab
+        self.vocab = dict(vocab)
         self.merges = merges
         self.special_tokens = special_tokens or []
+
+        # Keep special tokens as single vocabulary items.
+        if self.special_tokens:
+            vocab_values = set(self.vocab.values())
+            next_token_id = max(self.vocab, default=-1) + 1
+            for special_token in self.special_tokens:
+                special_token_bytes = special_token.encode("utf-8")
+                if special_token_bytes not in vocab_values:
+                    self.vocab[next_token_id] = special_token_bytes
+                    vocab_values.add(special_token_bytes)
+                    next_token_id += 1
+
+        self.token_to_id = {token_bytes: token_id for token_id, token_bytes in self.vocab.items()}
+        self.merge_ranks = {merge: rank for rank, merge in enumerate(merges)}
 
     @classmethod
     def from_files(
@@ -24,7 +45,7 @@ class Tokenizer:
         merges_filepath: str,
         special_tokens: list[str] | None = None,
     ) -> Tokenizer:
-        # the tokenzer traininig scripts
+        # the tokenizer training scripts
         # save vocab as {token_id: [byte0, byte1, ...]} and merges as lines like:
         # b' ' b't'
         bytes_literal_pair_re = re.compile(
@@ -54,25 +75,68 @@ class Tokenizer:
                 right = ast.literal_eval(match.group(2))
                 merges.append((left, right))
 
-        # add addiitonal user-provided special tokens to the vocab.
-        if special_tokens:
-            vocab_values = set(vocab.values())
-            next_token_id = max(vocab, default=-1) + 1
-            for special_token in special_tokens:
-                special_token_bytes = special_token.encode("utf-8")
-                if special_token_bytes not in vocab_values:
-                    vocab[next_token_id] = special_token_bytes
-                    vocab_values.add(special_token_bytes)
-                    next_token_id += 1
-
         return cls(vocab, merges, special_tokens)
 
     def encode(self, text: str) -> list[int]:
-        raise NotImplementedError
+        ids: list[int] = []
+
+        # Split around special tokens first so they stay intact. We sort by
+        # length so a longer token like "<|endoftext|><|endoftext|>" wins over
+        # two shorter matches.
+        text_parts = [text]
+        special_tokens_set = set(self.special_tokens)
+        if self.special_tokens:
+            sorted_special_tokens = sorted(self.special_tokens, key=len, reverse=True)
+            special_token_pattern = re.compile(
+                "(" + "|".join(re.escape(token) for token in sorted_special_tokens) + ")"
+            )
+            text_parts = special_token_pattern.split(text)
+
+        for part in text_parts:
+            if not part:
+                continue
+
+            if part in special_tokens_set:
+                ids.append(self.token_to_id[part.encode("utf-8")])
+                continue
+
+            # Match the same GPT-2-style pre-tokens used during BPE training.
+            for match in GPT2_PRETOKENIZER_PATTERN.finditer(part):
+                tokens = [bytes([byte]) for byte in match.group(0).encode("utf-8")]
+
+                # Repeatedly apply the earliest merge that is present.
+                while len(tokens) > 1:
+                    best_pair = None
+                    best_rank = None
+
+                    for pair in zip(tokens, tokens[1:]):
+                        rank = self.merge_ranks.get(pair)
+                        if rank is not None and (best_rank is None or rank < best_rank):
+                            best_pair = pair
+                            best_rank = rank
+
+                    if best_pair is None:
+                        break
+
+                    merged_tokens: list[bytes] = []
+                    i = 0
+                    while i < len(tokens):
+                        if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == best_pair:
+                            merged_tokens.append(tokens[i] + tokens[i + 1])
+                            i += 2
+                        else:
+                            merged_tokens.append(tokens[i])
+                            i += 1
+                    tokens = merged_tokens
+
+                ids.extend(self.token_to_id[token] for token in tokens)
+
+        return ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         for text in iterable:
             yield from self.encode(text)
 
     def decode(self, ids: list[int]) -> str:
-        raise NotImplementedError
+        all_bytes = b"".join(self.vocab[token_id] for token_id in ids)
+        return all_bytes.decode("utf-8", errors="replace")
