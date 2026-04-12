@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import os
 import re
+import time
 from collections import Counter
 
 import regex
@@ -13,6 +14,7 @@ GPT2_PRETOKENIZER_PATTERN = regex.compile(
 _WORKER_RAW_BYTES = b""
 _WORKER_SPECIAL_TOKENS: frozenset[bytes] = frozenset()
 _WORKER_SPLIT_RE: re.Pattern[bytes] | None = None
+TrainBPEStats = dict[str, int | float]
 
 
 def _init_worker(raw_bytes: bytes, special_tokens: tuple[bytes, ...]) -> None:
@@ -74,29 +76,50 @@ def train_bpe(
     input_path: str,
     vocab_size: int,
     special_tokens: list[str],
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    *,
+    num_workers: int | None = None,
+    collect_stats: bool = False,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]] | tuple[
+    dict[int, bytes], list[tuple[bytes, bytes]], TrainBPEStats
+]:
+    stats: TrainBPEStats = {}
+    total_start = time.perf_counter()
     special_tokens_bytes = tuple(tok.encode("utf-8") for tok in special_tokens)
 
+    read_start = time.perf_counter()
     with open(input_path, "rb") as f:
         raw_bytes = f.read()
+    stats["read_input_s"] = time.perf_counter() - read_start
+    stats["input_bytes"] = len(raw_bytes)
 
     # parallel pre-tokenization
-    num_chunks = os.cpu_count() // 2 or 1  # need to watch Youtube during the training, don't take all my CPU cores.
+    num_chunks = (
+        max(1, num_workers)
+        if num_workers is not None
+        else max(1, (os.cpu_count() or 1) // 2)
+    )
+    stats["requested_workers"] = num_chunks
+    boundaries_start = time.perf_counter()
     chunk_boundaries = _find_chunk_boundaries(raw_bytes, num_chunks, special_tokens_bytes)
+    stats["find_chunk_boundaries_s"] = time.perf_counter() - boundaries_start
     chunk_ranges = [
         (start, end)
         for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:])
         if start < end
     ]
+    stats["num_chunks"] = len(chunk_ranges)
 
     _init_worker(raw_bytes, special_tokens_bytes)
     pretoken_counts: Counter[bytes] = Counter()
 
+    pretokenize_start = time.perf_counter()
     if len(chunk_ranges) <= 1:
         if chunk_ranges:
             pretoken_counts = _pretokenize_chunk(chunk_ranges[0])
+        stats["worker_processes"] = int(bool(chunk_ranges))
     else:
         ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else None)
+        stats["worker_processes"] = min(len(chunk_ranges), num_chunks)
         with ctx.Pool(
             processes=min(len(chunk_ranges), num_chunks),
             initializer=_init_worker,
@@ -104,11 +127,16 @@ def train_bpe(
         ) as pool:
             for chunk_counts in pool.imap_unordered(_pretokenize_chunk, chunk_ranges):
                 pretoken_counts.update(chunk_counts)
+    stats["pretokenize_s"] = time.perf_counter() - pretokenize_start
+    stats["unique_pretokens"] = len(pretoken_counts)
 
     # convert pretokens to byte-tuple sequences with their counts
+    sequence_build_start = time.perf_counter()
     token_counts: Counter[tuple[bytes, ...]] = Counter()
     for pretoken, count in pretoken_counts.items():
         token_counts[tuple(bytes([b]) for b in pretoken)] += count
+    stats["build_token_sequences_s"] = time.perf_counter() - sequence_build_start
+    stats["unique_token_sequences"] = len(token_counts)
 
     # vocab: special tokens first, then 256 byte values
     vocab: dict[int, bytes] = {}
@@ -123,10 +151,12 @@ def train_bpe(
     # BPE merge loop
     merges: list[tuple[bytes, bytes]] = []
     num_merges = vocab_size - len(vocab)
+    stats["num_merges_requested"] = num_merges
 
     # index: for each token, which sequences contain it?
     # This lets us skip sequences that can't contain the best pair.
     from collections import defaultdict
+    merge_setup_start = time.perf_counter()
     token_to_seqs: dict[bytes, set[tuple[bytes, ...]]] = defaultdict(set)
     for seq in token_counts:
         for tok in seq:
@@ -143,12 +173,15 @@ def train_bpe(
     # max-heap by count only; ties are resolved by collecting all pairs at max count
     heap = [(-c, pair) for pair, c in pair_counts.items()]
     heapq.heapify(heap)
+    stats["prepare_merge_structures_s"] = time.perf_counter() - merge_setup_start
+    stats["initial_pair_count"] = len(pair_counts)
 
     def _push(pair):
         c = pair_counts.get(pair, 0)
         if c > 0:
             heapq.heappush(heap, (-c, pair))
 
+    merge_loop_start = time.perf_counter()
     for _ in range(num_merges):
         # find best valid pair (skip stale entries)
         while heap:
@@ -229,5 +262,11 @@ def train_bpe(
                 token_to_seqs[tok].discard(seq)
             for tok in new_seq_tuple:
                 token_to_seqs[tok].add(new_seq_tuple)
+    stats["merge_loop_s"] = time.perf_counter() - merge_loop_start
+    stats["num_merges_learned"] = len(merges)
+    stats["final_vocab_size"] = len(vocab)
+    stats["total_s"] = time.perf_counter() - total_start
 
+    if collect_stats:
+        return vocab, merges, stats
     return vocab, merges
