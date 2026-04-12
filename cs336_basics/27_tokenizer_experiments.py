@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from pathlib import Path
 
 from cs336_basics.tokenizer import Tokenizer
@@ -16,6 +17,7 @@ SAMPLE_SIZE = 10
 SEED = 0
 CHUNK_SIZE_BYTES = 4 * 1024 * 1024
 OUTPUT_DIR = ROOT / "data" / "tokenizer_experiments"
+TOP_DOCUMENTS_PER_CORPUS = 100
 CORPORA = {
     "tinystories": {
         "label": "TinyStories",
@@ -42,7 +44,7 @@ TOKENIZERS = {
 }
 
 
-def run_part_a(
+def run_part_abc_report(
     sample_size: int = SAMPLE_SIZE,
     seed: int = SEED,
     output_dir: Path = OUTPUT_DIR,
@@ -76,6 +78,7 @@ def run_part_a(
         tokenizer_name: {"bytes": 0, "tokens": 0, "by_corpus": {}}
         for tokenizer_name in TOKENIZERS
     }
+    tokenize_time_seconds = {tokenizer_name: 0.0 for tokenizer_name in TOKENIZERS}
     report: dict[str, object] = {
         "sample_size_per_corpus": sample_size,
         "seed": seed,
@@ -85,19 +88,19 @@ def run_part_a(
         "artifacts": {},
     }
 
-    # Stream each corpus, split on <|endoftext|>, and keep a uniform sample
-    # with reservoir sampling so we do not load the whole corpus into memory.
+    # Stream each corpus, split on <|endoftext|>, and keep only the first
+    # TOP_DOCUMENTS_PER_CORPUS docs in memory. Sample from those documents.
     for corpus_name, corpus in CORPORA.items():
         corpus_label = str(corpus["label"])
         corpus_path = Path(corpus["path"])
         rng = random.Random(seed + int(corpus["seed_offset"]))
-        sampled_documents: list[dict[str, object]] = []
+        candidate_documents: list[dict[str, object]] = []
         documents_seen = 0
         buffer = b""
         separator_len = len(special_token_bytes)
 
         with corpus_path.open("rb") as f:
-            while True:
+            while documents_seen < TOP_DOCUMENTS_PER_CORPUS:
                 chunk = f.read(chunk_size_bytes)
                 if not chunk:
                     if buffer.strip():
@@ -127,28 +130,35 @@ def run_part_a(
                         "text_preview": preview if len(preview) <= 120 else preview[:117] + "...",
                         "encodings": {},
                     }
-                    if len(sampled_documents) < sample_size:
-                        sampled_documents.append(document)
-                    else:
-                        replacement_index = rng.randrange(documents_seen)
-                        if replacement_index < sample_size:
-                            sampled_documents[replacement_index] = document
+                    candidate_documents.append(document)
 
-                if not chunk:
+                if documents_seen >= TOP_DOCUMENTS_PER_CORPUS:
                     break
 
         if documents_seen < sample_size:
             raise ValueError(
-                f"Corpus {corpus_path} only contained {documents_seen} non-empty documents."
+                f"Corpus {corpus_path} only contained {documents_seen} non-empty documents in top {TOP_DOCUMENTS_PER_CORPUS}."
             )
 
-        sampled_documents.sort(key=lambda document: int(document["document_index"]))
+        # Randomly sample 10 docs from the first TOP_DOCUMENTS_PER_CORPUS docs.
+        if len(candidate_documents) < sample_size:
+            raise ValueError(
+                f"Need at least {sample_size} docs in top {TOP_DOCUMENTS_PER_CORPUS},"
+                f" but found {len(candidate_documents)} in {corpus_path}."
+            )
+        sample_indices = rng.sample(range(len(candidate_documents)), k=sample_size)
+        sampled_documents = [
+            candidate_documents[idx]
+            for idx in sorted(sample_indices)
+        ]
+
         total_sampled_bytes = sum(int(document["utf8_bytes"]) for document in sampled_documents)
 
         # Encode the sampled documents with both tokenizers and compute
         # bytes/token on each corpus plus an overall combined score.
         for tokenizer_name, tokenizer in tokenizers.items():
             total_tokens = 0
+            t0 = time.perf_counter()
 
             for document in sampled_documents:
                 text = str(document["text"])
@@ -167,6 +177,7 @@ def run_part_a(
                 }
                 total_tokens += len(ids)
 
+            tokenize_time_seconds[tokenizer_name] += time.perf_counter() - t0
             compression_totals[tokenizer_name]["bytes"] += total_sampled_bytes
             compression_totals[tokenizer_name]["tokens"] += total_tokens
             compression_totals[tokenizer_name]["by_corpus"][corpus_name] = (
@@ -188,10 +199,14 @@ def run_part_a(
         if total_tokens == 0:
             raise ValueError(f"Tokenizer {TOKENIZERS[tokenizer_name]['label']} produced zero total tokens.")
 
+        total_bytes = totals["bytes"]
+        total_secs = tokenize_time_seconds[tokenizer_name]
         report["compression_ratios_bytes_per_token"][tokenizer_name] = {
             "label": TOKENIZERS[tokenizer_name]["label"],
             "by_corpus": totals["by_corpus"],
             "overall": totals["bytes"] / total_tokens,
+            "sample_throughput_bytes_per_s": 0.0 if total_secs == 0 else total_bytes / total_secs,
+            "sample_seconds": total_secs,
         }
 
     # Save a detailed JSON report and a compact text summary for the writeup.
@@ -207,6 +222,18 @@ def run_part_a(
         encoding="utf-8",
     )
 
+    # Report-only values for parts (b) and (c).
+    ts_scores = report["compression_ratios_bytes_per_token"]["tinystories_10k"]
+    owt_scores = report["compression_ratios_bytes_per_token"]["openwebtext_32k"]
+    ts_on_owt = ts_scores["by_corpus"]["openwebtext"]
+    ts_on_ts = ts_scores["by_corpus"]["tinystories"]
+
+    owt_tokenizer_throughput = owt_scores["sample_throughput_bytes_per_s"]
+    ts_tokenizer_throughput = ts_scores["sample_throughput_bytes_per_s"]
+    pile_bytes = 825 * 1024**3
+    owt_pile_hours = pile_bytes / owt_tokenizer_throughput / 3600 if owt_tokenizer_throughput else float("inf")
+    ts_pile_hours = pile_bytes / ts_tokenizer_throughput / 3600 if ts_tokenizer_throughput else float("inf")
+
     summary_lines = [f"sample_size={sample_size} seed={seed}"]
     for corpus_name, corpus in CORPORA.items():
         sample_indices = ", ".join(
@@ -220,11 +247,19 @@ def run_part_a(
     for tokenizer_name, tokenizer in TOKENIZERS.items():
         scores = report["compression_ratios_bytes_per_token"][tokenizer_name]
         summary_lines.append(
-            f"{tokenizer['label']}: "
-            f"TS={scores['by_corpus']['tinystories']:.4f} "
-            f"OWT={scores['by_corpus']['openwebtext']:.4f} "
-            f"all={scores['overall']:.4f}"
+            f"{tokenizer['label']} compression_ratio_bytes/token: "
+            f"tinystories={scores['by_corpus']['tinystories']:.4f} "
+            f"openwebtext={scores['by_corpus']['openwebtext']:.4f} "
+            f"combined={scores['overall']:.4f} "
+            f"sample_throughput_bytes_per_s={scores['sample_throughput_bytes_per_s']:.0f}B/s"
         )
+    summary_lines.append(f"part_b_tinystories_on_owt_bytes_per_token={ts_on_owt:.6f}")
+    summary_lines.append(f"part_b_tinystories_on_tinystories_bytes_per_token={ts_on_ts:.6f}")
+    summary_lines.append(f"part_b_delta_bytes_per_token={ts_on_owt-ts_on_ts:.6f}")
+    summary_lines.append(f"part_c_ts_bytes_per_second={ts_tokenizer_throughput:.0f}")
+    summary_lines.append(f"part_c_ts_hours_for_825GB={ts_pile_hours:.2f}")
+    summary_lines.append(f"part_c_owt_bytes_per_second={owt_tokenizer_throughput:.0f}")
+    summary_lines.append(f"part_c_owt_hours_for_825GB={owt_pile_hours:.2f}")
     summary_lines.append(f"reports: {json_report_path} | {markdown_report_path}")
     markdown_report_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
@@ -234,4 +269,4 @@ def run_part_a(
 
 
 if __name__ == "__main__":
-    run_part_a()
+    run_part_abc_report()
