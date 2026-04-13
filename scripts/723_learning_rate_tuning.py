@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import modal
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +30,18 @@ from cs336_basics.training_launcher_utils import (
 )
 from cs336_basics.training_together import train
 
-DEFAULT_LEARNING_RATES = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3]
+DEFAULT_LEARNING_RATES = [1e-5, 2e-5, 3e-5, 5e-5, 1e-4, 2e-4, 3e-4, 5e-4, 1e-3]
 DEFAULT_TARGET_TOKENS = 327_680_000
 
 
-@app.function(image=build_image(), volumes=VOLUME_MOUNTS, gpu="B200", max_containers=3)
+@app.function(
+    image=build_image(),
+    volumes=VOLUME_MOUNTS,
+    gpu="B200",
+    max_containers=3,
+    timeout=7200,
+    secrets=[modal.Secret.from_name("wandb")],
+)
 def launch_training_trial(train_kwargs: dict[str, Any]) -> dict[str, Any]:
     return train(**train_kwargs)
 
@@ -76,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-group", type=str, default="723-learning-rate-tuning")
     parser.add_argument("--wandb-notes", type=str, default=None)
     parser.add_argument("--wandb-tags", nargs="*", default=None)
-    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default="offline")
+    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default="online")
     return parser
 
 
@@ -176,8 +184,19 @@ def choose_best_result(results: list[dict[str, Any]]) -> dict[str, Any]:
     return min(results, key=result_score)
 
 
-def run_from_cli() -> None:
-    args = build_parser().parse_args()
+def _parse_csv_floats(value: str) -> list[float]:
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if not items:
+        raise ValueError("learning_rates must include at least one comma-separated float.")
+    return [float(item) for item in items]
+
+
+def _parse_csv_strings(value: str) -> list[str] | None:
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or None
+
+
+def run_from_args(args: argparse.Namespace) -> None:
     steps = steps_for_run(args)
     trial_kwargs = build_trial_kwargs(args, steps)
     print_launch_summary(args, steps)
@@ -212,8 +231,62 @@ def run_from_cli() -> None:
 
 
 @app.local_entrypoint()
-def modal_main() -> None:
-    run_from_cli()
+def modal_main(
+    learning_rates: str = "1e-5,3e-5,1e-4,3e-4,1e-3",
+    train_tokens_path: str = str(DEFAULT_REMOTE_TRAIN_PATH),
+    valid_tokens_path: str = str(DEFAULT_REMOTE_VALID_PATH),
+    token_dtype: str = str(SECTION_72_MODEL_CONFIG["token_dtype"]),
+    vocab_size: int = int(SECTION_72_MODEL_CONFIG["vocab_size"]),
+    context_length: int = 256,
+    batch_size: int = 32,
+    steps: int = 0,
+    target_tokens: int = DEFAULT_TARGET_TOKENS,
+    min_lr_ratio: float = 0.1,
+    warmup_fraction: float = 0.02,
+    log_every: int = 250,
+    eval_every: int = 250,
+    eval_batches: int = 4,
+    seed: int = 0,
+    dtype: str = "float32",
+    wandb_project: str = "cs336-a1",
+    wandb_run_prefix: str = "723-lr-sweep",
+    wandb_group: str = "723-learning-rate-tuning",
+    wandb_notes: str = "",
+    wandb_tags: str = "",
+    wandb_mode: str = "online",
+) -> None:
+    args = argparse.Namespace(
+        learning_rates=_parse_csv_floats(learning_rates),
+        local=False,
+        train_tokens_path=Path(train_tokens_path),
+        valid_tokens_path=Path(valid_tokens_path),
+        token_dtype=token_dtype,
+        vocab_size=vocab_size,
+        context_length=context_length,
+        batch_size=batch_size,
+        steps=steps if steps > 0 else None,
+        target_tokens=target_tokens,
+        min_lr_ratio=min_lr_ratio,
+        warmup_fraction=warmup_fraction,
+        log_every=log_every,
+        eval_every=eval_every,
+        eval_batches=eval_batches,
+        seed=seed,
+        device="cuda",
+        dtype=dtype,
+        wandb_project=wandb_project,
+        wandb_run_prefix=wandb_run_prefix,
+        wandb_group=wandb_group,
+        wandb_notes=wandb_notes or None,
+        wandb_tags=_parse_csv_strings(wandb_tags),
+        wandb_mode=wandb_mode,
+    )
+    run_from_args(args)
+
+
+def run_from_cli() -> None:
+    args = build_parser().parse_args()
+    run_from_args(args)
 
 
 if __name__ == "__main__":
