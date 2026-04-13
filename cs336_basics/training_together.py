@@ -37,6 +37,7 @@ SAFE_ENV_KEYS = (
     "WANDB_PROJECT",
 )
 MAX_GIT_STATUS_LINES = 200
+MODAL_VOLUME_MOUNT_ROOT = Path("/root/data")
 
 
 def _to_serializable(value: Any) -> Any:
@@ -270,14 +271,30 @@ def _collect_cuda_memory_metrics(device_obj: torch.device) -> dict[str, float]:
     }
 
 
+def _resolve_runtime_data_path(path: Path) -> Path:
+    """Handle Modal volume uploads that accidentally include the mount prefix."""
+
+    if path.exists():
+        return path
+    try:
+        path.relative_to(MODAL_VOLUME_MOUNT_ROOT)
+    except ValueError:
+        return path
+
+    nested_candidate = MODAL_VOLUME_MOUNT_ROOT / path.relative_to(Path("/"))
+    if nested_candidate.exists():
+        print(
+            f"[data] {path} not found, using nested Modal volume path {nested_candidate} instead"
+        )
+        return nested_candidate
+    return path
+
+
 def _configure_wandb_mode(wandb_mode: str | None) -> None:
     if wandb_mode is None:
         return
-    if wandb_mode in {"offline", "disabled"}:
+    if wandb_mode in {"online", "offline", "disabled"}:
         os.environ["WANDB_MODE"] = wandb_mode
-        return
-    if wandb_mode == "online":
-        os.environ.pop("WANDB_MODE", None)
         return
     raise ValueError("--wandb-mode must be one of: online, offline, disabled.")
 
@@ -322,7 +339,8 @@ def train(
     wandb_job_type: str | None = None,
     wandb_notes: str | None = None,
     wandb_tags: list[str] | None = None,
-    wandb_mode: str | None = None,
+    wandb_mode: str | None = "online",
+    disable_rmsnorm: bool = False,
 ) -> dict[str, Any]:
     if max_iters <= 0:
         raise ValueError("--max-iters must be positive.")
@@ -364,8 +382,18 @@ def train(
     token_dtype_np = token_dtype_map[token_dtype]
 
     # Load token arrays lazily from disk with memory mapping.
-    train_path = Path(train_tokens_path)
-    valid_path = Path(valid_tokens_path)
+    train_path = _resolve_runtime_data_path(Path(train_tokens_path))
+    valid_path = _resolve_runtime_data_path(Path(valid_tokens_path))
+    if not train_path.exists():
+        raise FileNotFoundError(
+            f"Train token file not found: {train_path}. If this is a Modal volume path, upload to the "
+            "volume root (for example '/tokenizer_experiments/...') rather than '/root/data/...'."
+        )
+    if not valid_path.exists():
+        raise FileNotFoundError(
+            f"Validation token file not found: {valid_path}. If this is a Modal volume path, upload to the "
+            "volume root (for example '/tokenizer_experiments/...') rather than '/root/data/...'."
+        )
     if train_path.suffix == ".npy":
         train_tokens = np.load(train_path, mmap_mode="r")
     else:
@@ -428,6 +456,7 @@ def train(
         "wandb_notes": wandb_notes,
         "wandb_tags": wandb_tags,
         "wandb_mode": wandb_mode,
+        "disable_rmsnorm": disable_rmsnorm,
     }
     # Keep W&B setup direct and visible for students: one init, periodic logs, one finish.
     _configure_wandb_mode(wandb_mode)
@@ -462,6 +491,16 @@ def train(
         device=torch.device(device),
         dtype=model_dtype,
     )
+    if disable_rmsnorm:
+        from cs336_basics.rmsnorm import RMSNorm
+
+        for name, module in model.named_modules():
+            if isinstance(module, RMSNorm):
+                parent_name, _, attr_name = name.rpartition(".")
+                parent = model if not parent_name else dict(model.named_modules())[parent_name]
+                setattr(parent, attr_name, torch.nn.Identity())
+        print("[ablation] All RMSNorm modules replaced with Identity.")
+
     model_parameters = list(model.parameters())
     device_obj = torch.device(device)
 
@@ -826,7 +865,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb-mode",
         type=str,
-        default=None,
+        default="online",
         choices=["online", "offline", "disabled"],
         help="Optional WANDB_MODE override for this run.",
     )
