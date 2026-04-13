@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import modal
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,13 @@ from cs336_basics.training_together import train
 LOW_RESOURCE_TARGET_TOKENS = 40_000_000
 
 
-@app.function(image=build_image(), volumes=VOLUME_MOUNTS, gpu="B200")
+@app.function(
+    image=build_image(),
+    volumes=VOLUME_MOUNTS,
+    gpu="B200",
+    timeout=7200,
+    secrets=[modal.Secret.from_name("wandb")],
+)
 def launch_training(train_kwargs: dict[str, Any]) -> dict[str, Any]:
     return train(**train_kwargs)
 
@@ -71,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-group", type=str, default="721-basic-testing")
     parser.add_argument("--wandb-notes", type=str, default=None)
     parser.add_argument("--wandb-tags", nargs="*", default=None)
-    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default="offline")
+    parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default="online")
     return parser
 
 
@@ -180,8 +187,12 @@ def print_result_summary(args: argparse.Namespace, summary: dict[str, Any]) -> N
         print(f"  best val loss: {summary['best_val_loss']:.4f} at step {summary['best_val_step']}")
 
 
-def run_from_cli() -> None:
-    args = build_parser().parse_args()
+def _parse_csv_strings(value: str) -> list[str] | None:
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or None
+
+
+def run_from_args(args: argparse.Namespace) -> None:
     train_kwargs = build_train_kwargs(args)
     print_launch_summary(args, train_kwargs)
     if args.local:
@@ -192,8 +203,68 @@ def run_from_cli() -> None:
 
 
 @app.local_entrypoint()
-def modal_main() -> None:
-    run_from_cli()
+def modal_main(
+    mode: str = "overfit",
+    train_tokens_path: str = str(DEFAULT_REMOTE_TRAIN_PATH),
+    valid_tokens_path: str = str(DEFAULT_REMOTE_VALID_PATH),
+    token_dtype: str = str(SECTION_72_MODEL_CONFIG["token_dtype"]),
+    vocab_size: int = int(SECTION_72_MODEL_CONFIG["vocab_size"]),
+    context_length: int = 256,
+    batch_size: int = 32,
+    steps: int = 0,
+    target_tokens: int = LOW_RESOURCE_TARGET_TOKENS,
+    lr: float = 3e-4,
+    min_lr: float = -1.0,
+    warmup_fraction: float = 0.02,
+    log_every: int = 50,
+    eval_every: int = 250,
+    eval_batches: int = 5,
+    target_val_loss: float = 2.0,
+    seed: int = 0,
+    dtype: str = "float32",
+    wandb_project: str = "cs336-a1-local",
+    wandb_run_name: str = "",
+    wandb_group: str = "721-basic-testing",
+    wandb_notes: str = "",
+    wandb_tags: str = "",
+    wandb_mode: str = "online",
+) -> None:
+    if mode not in {"overfit", "low-resource"}:
+        raise ValueError("mode must be either 'overfit' or 'low-resource'.")
+    args = argparse.Namespace(
+        mode=mode,
+        local=False,
+        train_tokens_path=Path(train_tokens_path),
+        valid_tokens_path=Path(valid_tokens_path),
+        token_dtype=token_dtype,
+        vocab_size=vocab_size,
+        context_length=context_length,
+        batch_size=batch_size,
+        steps=steps if steps > 0 else None,
+        target_tokens=target_tokens,
+        lr=lr,
+        min_lr=min_lr if min_lr > 0 else None,
+        warmup_fraction=warmup_fraction,
+        log_every=log_every,
+        eval_every=eval_every,
+        eval_batches=eval_batches,
+        target_val_loss=target_val_loss,
+        seed=seed,
+        device="cuda",
+        dtype=dtype,
+        wandb_project=wandb_project,
+        wandb_run_name=wandb_run_name or None,
+        wandb_group=wandb_group,
+        wandb_notes=wandb_notes or None,
+        wandb_tags=_parse_csv_strings(wandb_tags),
+        wandb_mode=wandb_mode,
+    )
+    run_from_args(args)
+
+
+def run_from_cli() -> None:
+    args = build_parser().parse_args()
+    run_from_args(args)
 
 
 if __name__ == "__main__":
