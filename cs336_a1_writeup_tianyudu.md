@@ -459,3 +459,74 @@ So the training time is approximately
 $$
 \boxed{4.84 \times 10^3 \text{ hours} \approx 201.5 \text{ days}.}
 $$
+
+
+# 7. Experiments
+## 7.1 How to Run Experiments and Deliverables
+### `experiment_log`
+I set up W&B logging directly in `training_together.py` so that every run automatically saves important experiment details—like the model architecture, optimization settings, dataset and checkpoint used, computing environment, and git state—but skips uploading any big model files. Throughout training and validation, the script regularly logs loss curves (both for gradient steps and actual wall-clock time), plus stats such as learning rate, training speed, gradient norms, timings, memory usage, and checkpoint info.,
+
+### `learning_rate` (a)
+To visualize the effect of different learning rates on training, I used `scripts/723_learning_rate_tuning.py` to sweep nine values. The figure below shows the same overall trend on the displayed runs (`1e-5`, `3e-5`, `1e-4`, `3e-4`, and `1e-3`): larger learning rates in this range converged faster and ended with lower validation loss, with final values of about `2.44`, `1.80`, `1.65`, `1.49`, and `1.43`, respectively. The model with `1e-3` performed best, achieveing the lowest final validation loss of `1.43`. Each training session took around 23 minutes to complete.
+![Learning rate sweep results](figures/7.2.3a_learning_rate.png)
+
+### `learning_rate` (b) more exploration
+When the learning rate becomes too large (e.g., 0.02), the training loss becomes instable and fail to converge to a reasonly low value.
+
+![Learning rate sweep results](figures/7.2.3b_learning_rate_explode.png)
+
+When I try a large learning rate (1.0), the validation loss explodes and the training stopped due to numerical overflow.
+![Learning rate sweep results](figures/7.2.3b_explode_2.png)
+
+For reference, I have also attached the training loss curve below.
+![Learning rate sweep results](figures/7.2.3_training_loss.png)
+
+During this set of experiments, when the learning rate is too small (e.g., 1e-5), the training loss was converging slowly but the validation loss failed to converge to a reasonable value before the computational budget was exhausted. At a balanced point, the learning rate of 1e-3 performed best, achieving the lowest final validation loss of 1.43, below the 1.45 requirement. When the learning rate was too large, the training loss became instable and numerical overflow was encountered.
+
+### `batch_size_experiment`
+I have experiment with batch size of 32, 64, 128, 256, 512, 1024. The figure below shows the validation loss curve for each batch size. Since the total number of tokens procssed is fixed, a larger batch size results in fewer training steps. At a batch size of 1024, the GPU memory usage was around 155GiB, indiciating that this is clos to the B200's memory limit, use a higher batch size of 2048 will lead to OOM.
+
+With a batch size of 1024, the model was clearly under-fitting, the validation loss stopped at 1.52, with a small batch size of 32, the gradient update became too noisy and the validation loss was oscillated around 1.45, and landed at 1.48. With a balanced batch size between 64 and 256, the validation loss was optimal at 1.42.
+
+![Batch size experiment results](figures/7.2.3_batch_size.png)
+
+
+### `generate`
+Please see the following command and output for generating text from the checkpoint. Note that the assignment did not explicitly speficy the decoding parameters or the prompt, so I was using the 'Once upon a time' prompt and tried a few parameters. The following one is the result I found reasonable.
+```
+(cs336-basics) (base) ➜  cs336-assignment1-basics git:(main) ✗ uv run python scripts/generate.py \
+  --checkpoint-path checkpoints/723-learning-rate-tuning/0_001.pt \
+  --vocab-path data/bpe_tinystories/vocab.json \
+  --merges-path data/bpe_tinystories/merges.txt \
+  --prompt "Once upon a time" \
+  --max-new-tokens 256 \
+  --temperature 0.8 \
+  --top-p 0.95
+Loading tokenizer from data/bpe_tinystories/vocab.json ...
+Building model on mps ...
+Loading checkpoint from checkpoints/723-learning-rate-tuning/0_001.pt ...
+Generating up to 256 tokens (temp=0.8, top_p=0.95) ...
+
+--- Config ---
+checkpoint : checkpoints/723-learning-rate-tuning/0_001.pt
+iteration  : 40000
+device     : mps
+dtype      : float32
+temperature: 0.8
+top_p      : 0.95
+seed       : 0
+prompt     : 'Once upon a time'
+new tokens : 242
+stopped_eos: True
+
+--- Generated text ---
+
+Once upon a time, in a small town, there lived a boy named Tim. Tim had a toy gun that he loved to play with. One day, Tim saw a big box in his room. He was very happy and thought it would be fun to play with his gun.
+Tim played with his gun outside. He pretended to shoot at trees and flowers. He had so much fun that he didn't want to stop. But then, Tim saw a big rock in his way. He knew he had to be careful not to step on it.
+Tim started to play with his toy gun. He pretended to shoot at the big rock. He was having a lot of fun. But then, Tim got too close to the rock. The rock hit the big rock and broke into pieces. Tim was very sad and scared. He cried and ran inside.
+His mom saw what happened and talked to Tim. She told him not to play with the gun that could break. Tim learned that he should listen to his mom and not play with things that are not safe. From that day on, Tim always played with his toy gun and safe toys, but he never went outside to play in the dark.
+```
+
+This run generated 242 new tokens before emitting the end-of-sequence token, so it satisfies the requirement of generating up to 256 tokens or stopping at the first `<|endoftext|>` token. Overall, the output is fairly fluent: most sentences are grammatical, easy to read, and consistent with the simple TinyStories style. However, the story is not very coherent over longer stretches. It repeats phrases such as "big rock" and "play with his gun," and some transitions are awkward or do not make much sense.
+
+At least two factors affect the quality of this sample. First, model capacity and checkpoint quality matter: with a relatively small model and limited training, the model can learn local grammar and short-range patterns without fully learning long-range coherence. Second, the decoding parameters matter: using `temperature=0.8` and `top-p=0.95` helps produce more varied continuations, but it also makes the output more likely to drift, repeat itself, or introduce inconsistencies.
