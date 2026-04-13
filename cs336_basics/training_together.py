@@ -681,7 +681,7 @@ def train(
                         val_losses.append(val_loss.item())
                 eval_time = time.perf_counter() - eval_start
                 mean_val_loss = float(np.mean(val_losses))
-                val_perplexity = math.exp(mean_val_loss)
+                val_perplexity = math.exp(min(mean_val_loss, 20.0))
                 last_val_loss = mean_val_loss
                 elapsed = max(time.perf_counter() - train_start, 1e-8)
                 print(
@@ -765,11 +765,11 @@ def train(
             run.summary["train/final_accuracy"] = last_train_accuracy
         if last_val_loss is not None:
             run.summary["val/final_loss"] = last_val_loss
-            run.summary["val/final_perplexity"] = math.exp(last_val_loss)
+            run.summary["val/final_perplexity"] = math.exp(min(last_val_loss, 20.0))
         if best_val_step is not None:
             run.summary["val/best_step"] = best_val_step
             run.summary["val/best_loss"] = best_val_loss
-            run.summary["val/best_perplexity"] = math.exp(best_val_loss)
+            run.summary["val/best_perplexity"] = math.exp(min(best_val_loss, 20.0))
         run.finish()
 
     summary: dict[str, Any] = {
@@ -785,9 +785,9 @@ def train(
     if last_train_loss is not None:
         summary["final_train_perplexity"] = math.exp(min(last_train_loss, 20.0))
     if last_val_loss is not None:
-        summary["final_val_perplexity"] = math.exp(last_val_loss)
+        summary["final_val_perplexity"] = math.exp(min(last_val_loss, 20.0))
     if best_val_step is not None:
-        summary["best_val_perplexity"] = math.exp(best_val_loss)
+        summary["best_val_perplexity"] = math.exp(min(best_val_loss, 20.0))
     return summary
 
 
