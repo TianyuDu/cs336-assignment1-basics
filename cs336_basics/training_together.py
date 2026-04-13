@@ -270,6 +270,18 @@ def _collect_cuda_memory_metrics(device_obj: torch.device) -> dict[str, float]:
     }
 
 
+def _configure_wandb_mode(wandb_mode: str | None) -> None:
+    if wandb_mode is None:
+        return
+    if wandb_mode in {"offline", "disabled"}:
+        os.environ["WANDB_MODE"] = wandb_mode
+        return
+    if wandb_mode == "online":
+        os.environ.pop("WANDB_MODE", None)
+        return
+    raise ValueError("--wandb-mode must be one of: online, offline, disabled.")
+
+
 def train(
     *,
     train_tokens_path: str,
@@ -302,13 +314,16 @@ def train(
     seed: int = 0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     dtype: str = "float32",
+    fixed_batch: bool = False,
+    target_val_loss: float | None = None,
     wandb_project: str = "cs336-a1",
     wandb_run_name: str | None = None,
     wandb_group: str | None = None,
     wandb_job_type: str | None = None,
     wandb_notes: str | None = None,
     wandb_tags: list[str] | None = None,
-) -> None:
+    wandb_mode: str | None = None,
+) -> dict[str, Any]:
     if max_iters <= 0:
         raise ValueError("--max-iters must be positive.")
     if batch_size <= 0:
@@ -323,6 +338,10 @@ def train(
         raise ValueError("--cosine-cycle-iters must be greater than --warmup-iters.")
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise ValueError("Requested CUDA device but CUDA is not available.")
+    if device.startswith("mps") and not (
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    ):
+        raise ValueError("Requested MPS device but MPS is not available.")
 
     # Make sampling and initialization reproducible.
     np.random.seed(seed)
@@ -400,14 +419,18 @@ def train(
         "seed": seed,
         "device": device,
         "dtype": dtype,
+        "fixed_batch": fixed_batch,
+        "target_val_loss": target_val_loss,
         "wandb_project": wandb_project,
         "wandb_run_name": wandb_run_name,
         "wandb_group": wandb_group,
         "wandb_job_type": wandb_job_type,
         "wandb_notes": wandb_notes,
         "wandb_tags": wandb_tags,
+        "wandb_mode": wandb_mode,
     }
     # Keep W&B setup direct and visible for students: one init, periodic logs, one finish.
+    _configure_wandb_mode(wandb_mode)
     run = wandb.init(
         project=wandb_project,
         name=wandb_run_name,
@@ -487,10 +510,20 @@ def train(
         torch.cuda.reset_peak_memory_stats(device_obj)
 
     model.train()
+    fixed_inputs: torch.Tensor | None = None
+    fixed_targets: torch.Tensor | None = None
+    if fixed_batch:
+        fixed_inputs, fixed_targets = data_loading(
+            x=train_tokens,
+            batch_size=batch_size,
+            context_length=context_length,
+            device=device,
+        )
     train_start = time.perf_counter()
     best_val_loss = math.inf
     best_val_step: int | None = None
     last_train_loss: float | None = None
+    last_train_accuracy: float | None = None
     last_val_loss: float | None = None
     last_completed_step = start_step
     run_status = "completed"
@@ -508,18 +541,27 @@ def train(
                 param_group["lr"] = lr
 
             completed_step = step + 1
-            should_log_train = completed_step % log_every == 0 or completed_step == start_step + 1
+            should_log_train = (
+                completed_step % log_every == 0
+                or completed_step == start_step + 1
+                or completed_step == max_iters
+            )
             should_eval = completed_step % eval_every == 0 or completed_step == max_iters
             should_save = completed_step % save_every == 0 or completed_step == max_iters
+            stop_early = False
 
             step_start = time.perf_counter()
-            inputs, targets = data_loading(
-                x=train_tokens,
-                batch_size=batch_size,
-                context_length=context_length,
-                device=device,
-            )
-            data_loading_time = time.perf_counter() - step_start
+            if fixed_inputs is not None and fixed_targets is not None:
+                inputs, targets = fixed_inputs, fixed_targets
+                data_loading_time = 0.0
+            else:
+                inputs, targets = data_loading(
+                    x=train_tokens,
+                    batch_size=batch_size,
+                    context_length=context_length,
+                    device=device,
+                )
+                data_loading_time = time.perf_counter() - step_start
 
             forward_start = time.perf_counter()
             logits = model(inputs)
@@ -538,6 +580,8 @@ def train(
             optimizer.step()
             backward_optimizer_time = time.perf_counter() - backward_start
             step_time = time.perf_counter() - step_start
+            train_loss = float(loss.item())
+            last_train_loss = train_loss
 
             # Human-readable step count (1-based) for logging/checkpoint metadata.
             last_completed_step = completed_step
@@ -546,8 +590,9 @@ def train(
                 tokens_seen_since_resume = (completed_step - start_step) * batch_tokens
                 total_tokens_seen = completed_step * batch_tokens
                 tokens_per_sec = tokens_seen_since_resume / elapsed
-                train_loss = loss.item()
-                last_train_loss = train_loss
+                train_perplexity = math.exp(min(train_loss, 20.0))
+                train_accuracy = float((logits.argmax(dim=-1) == targets).float().mean().item())
+                last_train_accuracy = train_accuracy
                 print(
                     f"[train] step={completed_step} loss={train_loss:.4f} "
                     f"lr={lr:.6g} tok/s={tokens_per_sec:.1f} step_time={step_time:.3f}s"
@@ -558,6 +603,8 @@ def train(
                     "trainer/elapsed_wall_time_sec": elapsed,
                     "train/elapsed_wall_time_sec": elapsed,
                     "train/loss": train_loss,
+                    "train/perplexity": train_perplexity,
+                    "train/accuracy": train_accuracy,
                     "train/lr": lr,
                     "train/batch_tokens": batch_tokens,
                     "train/tokens_seen_since_resume": tokens_seen_since_resume,
@@ -621,9 +668,16 @@ def train(
                     run.summary["val/best_loss"] = best_val_loss
                     run.summary["val/best_step"] = best_val_step
                     run.summary["val/best_perplexity"] = val_perplexity
+                if target_val_loss is not None and mean_val_loss <= target_val_loss:
+                    print(
+                        f"[valid] reached target val loss {target_val_loss:.4f} "
+                        f"at step {completed_step}; stopping early"
+                    )
+                    run.summary["val/target_loss"] = target_val_loss
+                    stop_early = True
                 model.train()
 
-            if should_save:
+            if should_save or stop_early:
                 # Save model + optimizer + current step so training can resume exactly.
                 save_start = time.perf_counter()
                 save_checkpoint(
@@ -648,6 +702,8 @@ def train(
                 run.summary["checkpoint/last_saved_step"] = completed_step
                 run.summary["checkpoint/last_saved_path"] = str(checkpoint_path_obj.resolve())
                 print(f"[ckpt] saved checkpoint to {checkpoint_path_obj} at step {completed_step}")
+            if stop_early:
+                break
     except BaseException as exc:
         run_status = "failed"
         run.summary["run/exception_type"] = type(exc).__name__
@@ -665,6 +721,9 @@ def train(
         run.summary["trainer/final_approx_dataset_passes"] = total_tokens_seen / len(train_tokens)
         if last_train_loss is not None:
             run.summary["train/final_loss"] = last_train_loss
+            run.summary["train/final_perplexity"] = math.exp(min(last_train_loss, 20.0))
+        if last_train_accuracy is not None:
+            run.summary["train/final_accuracy"] = last_train_accuracy
         if last_val_loss is not None:
             run.summary["val/final_loss"] = last_val_loss
             run.summary["val/final_perplexity"] = math.exp(last_val_loss)
@@ -673,6 +732,24 @@ def train(
             run.summary["val/best_loss"] = best_val_loss
             run.summary["val/best_perplexity"] = math.exp(best_val_loss)
         run.finish()
+
+    summary: dict[str, Any] = {
+        "status": run_status,
+        "final_step": last_completed_step,
+        "checkpoint_path": str(checkpoint_path_obj.resolve()),
+        "final_train_loss": last_train_loss,
+        "final_train_accuracy": last_train_accuracy,
+        "final_val_loss": last_val_loss,
+        "best_val_loss": best_val_loss if best_val_step is not None else None,
+        "best_val_step": best_val_step,
+    }
+    if last_train_loss is not None:
+        summary["final_train_perplexity"] = math.exp(min(last_train_loss, 20.0))
+    if last_val_loss is not None:
+        summary["final_val_perplexity"] = math.exp(last_val_loss)
+    if best_val_step is not None:
+        summary["best_val_perplexity"] = math.exp(best_val_loss)
+    return summary
 
 
 if __name__ == "__main__":
@@ -723,6 +800,18 @@ if __name__ == "__main__":
         default="float32",
         choices=["float32", "float16", "bfloat16"],
     )
+    parser.add_argument(
+        "--fixed-batch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reuse one sampled training batch on every step.",
+    )
+    parser.add_argument(
+        "--target-val-loss",
+        type=float,
+        default=None,
+        help="Stop early once validation loss reaches this threshold.",
+    )
     parser.add_argument("--wandb-project", type=str, default="cs336-a1")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-group", type=str, default=None)
@@ -733,6 +822,13 @@ if __name__ == "__main__":
         nargs="*",
         default=None,
         help="Optional W&B tags to help group related experiments.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default=None,
+        choices=["online", "offline", "disabled"],
+        help="Optional WANDB_MODE override for this run.",
     )
     cli_args = parser.parse_args()
     train(**vars(cli_args))
