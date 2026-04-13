@@ -182,6 +182,7 @@ part_c_owt_hours_for_825GB=284.68
 **(c)** The estimated tokenizer throughput for the TinyStories corpus is 914182 bytes/second, which will take approximately 269.17 hours to tokenize 825GB of data. The estimated tokenizer throughput for the OpenWebText corpus is 864358 bytes/second, which will take approximately 284.68 hours to tokenize 825GB of data.
 
 **(d)**
+uint16 is an appropriate choice for storing token IDs because the vocabulary size (32K) fits well within the 16-bit range (0 to 65,536), without overflow or wasting memory.
 
 ## 3.5 The Full Transformer LM `transformer_accounting`
 ### (a)
